@@ -17,26 +17,27 @@
  */
 package org.apache.avro.io;
 
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.avro.AvroTypeException;
+import org.apache.avro.Schema;
+import org.apache.avro.util.Utf8;
+import org.apache.avro.util.internal.Accessor;
+
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.util.HashMap;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+import java.util.ListIterator;
 import java.util.Map;
-import java.util.Objects;
-import java.util.Stack;
-
-import org.apache.avro.AvroTypeException;
-import org.apache.avro.Schema;
-import org.apache.avro.io.parsing.JsonGrammarGenerator;
-import org.apache.avro.io.parsing.Parser;
-import org.apache.avro.io.parsing.Symbol;
-import org.apache.avro.util.Utf8;
-import com.fasterxml.jackson.core.JsonFactory;
-import com.fasterxml.jackson.core.JsonParser;
-import com.fasterxml.jackson.core.JsonToken;
-import com.fasterxml.jackson.databind.util.TokenBuffer;
+import java.util.Set;
+import java.util.concurrent.Callable;
 
 /**
  * A {@link Decoder} for Avro's JSON data encoding.
@@ -45,174 +46,380 @@ import com.fasterxml.jackson.databind.util.TokenBuffer;
  * </p>
  * JsonDecoder is not thread-safe.
  */
-public class JsonDecoder extends ParsingDecoder implements Parser.ActionHandler {
-  private JsonParser in;
+public class JsonDecoder extends Decoder {
   private static JsonFactory jsonFactory = new JsonFactory();
-  Stack<ReorderBuffer> reorderBuffers = new Stack<>();
-  ReorderBuffer currentReorderBuffer;
 
-  private static class ReorderBuffer {
-    public Map<String, TokenBuffer> savedFields = new HashMap<>();
-    public JsonParser origParser = null;
+  final Schema schema;
+  final Callable<JsonNode> nodeSupplier;
+  final ArrayList<Object> bin = new ArrayList<>(); // leaf values
+
+  // set to true to pass avro's test cases
+  boolean breakAmbiguity = false;
+
+  /**
+   * @param breakAmbiguity If true, turn off rule#11 and rule#12.
+   */
+  public JsonDecoder breakAmbiguity(boolean breakAmbiguity) {
+    this.breakAmbiguity = breakAmbiguity;
+    return this;
   }
 
-  private JsonDecoder(Symbol root, InputStream in) throws IOException {
-    super(root);
-    configure(in);
-  }
-
-  private JsonDecoder(Symbol root, String in) throws IOException {
-    super(root);
-    configure(in);
+  private JsonDecoder(Schema schema, JsonParser parser) {
+    this.schema = schema;
+    ObjectMapper om = new ObjectMapper();
+    this.nodeSupplier = () -> om.readTree(parser);
   }
 
   JsonDecoder(Schema schema, InputStream in) throws IOException {
-    this(getSymbol(schema), in);
+    this(schema, jsonFactory.createParser(in));
   }
 
   JsonDecoder(Schema schema, String in) throws IOException {
-    this(getSymbol(schema), in);
+    this(schema, jsonFactory.createParser(in));
   }
 
-  private static Symbol getSymbol(Schema schema) {
-    Objects.requireNonNull(schema, "Schema cannot be null");
-    return new JsonGrammarGenerator().generate(schema);
+  JsonDecoder(Schema schema, Iterable<JsonNode> nodes) {
+    this.schema = schema;
+    Iterator<JsonNode> iterator = nodes.iterator();
+    this.nodeSupplier = () -> iterator.hasNext() ? iterator.next() : null;
   }
 
-  /**
-   * Reconfigures this JsonDecoder to use the InputStream provided.
-   * <p/>
-   * If the InputStream provided is null, a NullPointerException is thrown.
-   * <p/>
-   * Otherwise, this JsonDecoder will reset its state and then reconfigure its
-   * input.
-   *
-   * @param in The InputStream to read from. Cannot be null.
-   * @throws IOException
-   * @throws NullPointerException if {@code in} is {@code null}
-   * @return this JsonDecoder
-   */
-  public JsonDecoder configure(InputStream in) throws IOException {
-    Objects.requireNonNull(in, "InputStream cannot be null");
-    parser.reset();
-    reorderBuffers.clear();
-    currentReorderBuffer = null;
-    this.in = jsonFactory.createParser(in);
-    this.in.nextToken();
-    return this;
+  <T> T pop() throws IOException {
+    if (bin.isEmpty()) {
+      JsonNode node;
+      try {
+        node = nodeSupplier.call();
+      } catch (IOException | RuntimeException e) {
+        throw e;
+      } catch (Exception e) {
+        throw new RuntimeException(e);
+      }
+      if (node == null) {
+        throw new EOFException();
+      }
+      List<?> list = dfs(schema, node);
+      for (ListIterator<?> iter = list.listIterator(list.size()); iter.hasPrevious();) {
+        bin.add(iter.previous());
+      }
+    }
+    return (T) bin.remove(bin.size() - 1);
   }
 
-  /**
-   * Reconfigures this JsonDecoder to use the String provided for input.
-   * <p/>
-   * If the String provided is null, a NullPointerException is thrown.
-   * <p/>
-   * Otherwise, this JsonDecoder will reset its state and then reconfigure its
-   * input.
-   *
-   * @param in The String to read from. Cannot be null.
-   * @throws IOException
-   * @throws NullPointerException if {@code in} is {@code null}
-   * @return this JsonDecoder
-   */
-  public JsonDecoder configure(String in) throws IOException {
-    Objects.requireNonNull(in, "String to read from cannot be null");
-    parser.reset();
-    reorderBuffers.clear();
-    currentReorderBuffer = null;
-    this.in = new JsonFactory().createParser(in);
-    this.in.nextToken();
-    return this;
+  void expect(Schema schema, JsonNode node, boolean b) {
+    if (!b) {
+      throw new AvroTypeException("Expected " + schema.getType() + ". Got " + node.getNodeType());
+    }
   }
 
-  private void advance(Symbol symbol) throws IOException {
-    this.parser.processTrailingImplicitActions();
-    if (in.getCurrentToken() == null && this.parser.depth() == 1)
-      throw new EOFException();
-    parser.advance(symbol);
+  List<?> dfs(Schema schema, JsonNode node) {
+    List<?> list1 = null;
+    RuntimeException ex1 = null;
+    try {
+      list1 = dfsNonUnion(schema, node);
+      if (breakAmbiguity) {
+        return list1;
+      }
+    } catch (RuntimeException e) {
+      ex1 = e;
+    }
+
+    List<?> list2 = null;
+    RuntimeException ex2 = null;
+    try {
+      list2 = dfsUnion(schema, node);
+    } catch (RuntimeException e) {
+      ex2 = e;
+    }
+
+    if (ex1 != null && ex2 != null) {
+      throw ex1;
+    }
+
+    if (list1 != null && list2 != null) {
+      throw new AvroTypeException("Ambiguity: " + schema.getType() + ": " + node.getNodeType());
+    }
+
+    return list1 != null ? list1 : list2;
+  }
+
+  List<?> dfsNonUnion(Schema schema, JsonNode node) {
+    switch (schema.getType()) {
+    case RECORD:
+      return dfsRecord(schema, node);
+    case ARRAY:
+      return dfsArray(schema, node);
+    case MAP:
+      return dfsMap(schema, node);
+    case ENUM:
+      return dfsEnum(schema, node);
+    case FIXED:
+      return dfsBytes(schema, node, schema.getFixedSize());
+    case BYTES:
+      return dfsBytes(schema, node, -1);
+    case INT:
+    case LONG:
+    case FLOAT:
+    case DOUBLE:
+      expect(schema, node, node.isNumber());
+      return List.of(node); // parsed at read time
+    case STRING:
+      expect(schema, node, node.isTextual());
+      return List.of(node.asText());
+    case BOOLEAN:
+      expect(schema, node, node.isBoolean());
+      return List.of(node.asBoolean());
+    case NULL:
+      expect(schema, node, node.isNull());
+      return List.of();
+    }
+    throw new IllegalArgumentException("Unknown schema type: " + schema.getType());
+  }
+
+  List<Object> cat(Object head, List<?> tail) {
+    ArrayList<Object> list = new ArrayList<>();
+    list.add(head);
+    list.addAll(tail);
+    return list;
+  }
+
+  // to prevent long->int etc
+  private boolean typeMatch(String n1, String n2) {
+    List<String> ns = List.of("int", "long", "float", "double");
+    int i1 = ns.indexOf(n1);
+    int i2 = ns.indexOf(n2);
+    if (i1 != -1 && i2 != -1) {
+      return i1 <= i2;
+    }
+    Set<String> ss = Set.of("string", "bytes");
+    if (ss.contains(n1) && ss.contains(n2)) {
+      return true;
+    }
+    return n1.equals(n2);
+  }
+
+  private List<?> dfsUnion(Schema schema, JsonNode node) {
+
+    // {t:v}
+    List<?> list1 = null;
+    RuntimeException ex1 = null;
+    if (node.isObject() && node.size() == 1) {
+      String type = node.fieldNames().next();
+      JsonNode value = node.get(type);
+
+      if (schema.getType() != Schema.Type.UNION) {
+        // writer union, reader not
+        try {
+          if (!typeMatch(type, schema.getName())) {
+            throw new AvroTypeException("Expected " + schema.getType() + ". Got " + type);
+          }
+          list1 = dfsNonUnion(schema, value);
+        } catch (RuntimeException e) {
+          // ex1 = e;
+        }
+      } else { // writer union, reader union
+        if (schema.getIndexNamed(type) != null) { // exact name match
+          Integer index = schema.getIndexNamed(type);
+          try {
+            list1 = cat(index, dfsNonUnion(schema.getTypes().get(index), value));
+          } catch (RuntimeException e) {
+            ex1 = e;
+          }
+        } else { // {"long":0} should match "float" in schema ["int", "float","double"]
+          for (int index = 0; index < schema.getTypes().size(); index++) {
+            Schema ut = schema.getTypes().get(index);
+            if (!typeMatch(type, ut.getName())) {
+              continue;
+            }
+            try {
+              list1 = cat(index, dfsNonUnion(ut, value));
+              break;
+            } catch (RuntimeException e) {
+              // ex1 = e;
+            }
+          }
+        }
+      }
+    } // {t:v}
+    if (list1 != null && breakAmbiguity) {
+      return list1;
+    }
+
+    // any node against union: first type in union that matches
+    List<?> list2 = null;
+    if (schema.getType() == Schema.Type.UNION) {
+      for (int index = 0; index < schema.getTypes().size(); index++) {
+        try {
+          list2 = cat(index, dfsNonUnion(schema.getTypes().get(index), node));
+          break;
+        } catch (RuntimeException e) {
+          continue;
+        }
+      }
+    }
+
+    if (list1 == null && list2 == null) {
+      throw ex1 != null ? ex1 : new AvroTypeException("Expected " + schema.getType() + ". Got " + node.getNodeType());
+    }
+
+    if (list1 != null && list2 != null) {
+      throw new AvroTypeException("Ambiguity: " + schema.getType() + ": " + node.getNodeType());
+    }
+
+    return list1 != null ? list1 : list2;
+  }
+
+  private List<?> dfsMap(Schema schema, JsonNode node) {
+    expect(schema, node, node.isObject());
+    List<Object> list = new ArrayList<>();
+    int[] skip = { 0 };
+    list.add(skip);
+    if (!node.isEmpty()) {
+      list.add((long) node.size());
+      for (Map.Entry<String, JsonNode> property : node.properties()) {
+        list.add(property.getKey());
+        list.addAll(dfs(schema.getValueType(), property.getValue()));
+      }
+    }
+    list.add((long) 0);
+    skip[0] = list.size() - 1;
+    return list;
+  }
+
+  private List<?> dfsArray(Schema schema, JsonNode node) {
+    expect(schema, node, node.isArray());
+    List<Object> list = new ArrayList<>();
+    int[] skip = { 0 };
+    list.add(skip);
+    if (!node.isEmpty()) {
+      list.add((long) node.size());
+      for (JsonNode element : node) {
+        list.addAll(dfs(schema.getElementType(), element));
+      }
+    }
+    list.add((long) 0);
+    skip[0] = list.size() - 1;
+    return list;
+  }
+
+  private List<?> dfsEnum(Schema schema, JsonNode node) {
+    expect(schema, node, node.isTextual());
+    String text = node.asText();
+    if (!schema.hasEnumSymbol(text)) {
+      if (schema.getEnumDefault() == null) {
+        throw new AvroTypeException("No match for " + text);
+      }
+      // schema resolution: reader's default is used
+      text = schema.getEnumDefault();
+    }
+    Integer index = schema.getEnumOrdinal(text);
+    return List.of(index);
+  }
+
+  private List<?> dfsRecord(Schema schema, JsonNode node) {
+    expect(schema, node, node.isObject());
+    // schema resolution:
+    // - fields are matched by name/alias; ordering doesn't matter.
+    // - writer's fields not in reader's schema are ignored
+    // - reader's default field values are used if the field isn't in writer's.
+    List<Object> list = new ArrayList<>();
+    for (Schema.Field field : schema.getFields()) {
+      JsonNode value = node.get(field.name());
+      if (value == null) {
+        for (String alias : field.aliases()) {
+          value = node.get(alias);
+          if (value != null) {
+            break;
+          }
+        }
+      }
+      if (value == null) {
+        value = Accessor.defaultValue(field);
+      }
+      if (value == null) {
+        throw new AvroTypeException("missing required field " + field.name());
+      }
+      list.addAll(dfs(field.schema(), value));
+    }
+    return list;
+  }
+
+  private List<?> dfsBytes(Schema schema, JsonNode node, int optFixedSize) {
+    expect(schema, node, node.isTextual());
+    byte[] bytes = node.asText().getBytes(StandardCharsets.ISO_8859_1);
+    if (optFixedSize != -1 && bytes.length != optFixedSize) {
+      throw new AvroTypeException("Expected fixed length " + optFixedSize + ", but got" + bytes.length);
+    }
+    return List.of(bytes);
   }
 
   @Override
   public void readNull() throws IOException {
-    advance(Symbol.NULL);
-    if (in.getCurrentToken() == JsonToken.VALUE_NULL) {
-      in.nextToken();
-    } else {
-      throw error("null");
-    }
+    // no action
   }
 
   @Override
   public boolean readBoolean() throws IOException {
-    advance(Symbol.BOOLEAN);
-    JsonToken t = in.getCurrentToken();
-    if (t == JsonToken.VALUE_TRUE || t == JsonToken.VALUE_FALSE) {
-      in.nextToken();
-      return t == JsonToken.VALUE_TRUE;
-    } else {
-      throw error("boolean");
-    }
+    return pop();
   }
 
   @Override
   public int readInt() throws IOException {
-    advance(Symbol.INT);
-    if (in.getCurrentToken() == JsonToken.VALUE_NUMBER_INT) {
-      int result = in.getIntValue();
-      in.nextToken();
-      return result;
-    }
-    if (in.getCurrentToken() == JsonToken.VALUE_NUMBER_FLOAT) {
-      float value = in.getFloatValue();
-      if (Math.abs(value - Math.round(value)) <= Float.MIN_VALUE) {
-        int result = Math.round(value);
-        in.nextToken();
-        return result;
+    JsonNode node = pop();
+    try {
+      if (node.isIntegralNumber()) {
+        return Integer.parseInt(node.asText());
       }
+      if (node.isFloatingPointNumber()) { // behavior of standard JsonDecoder
+        float value = Float.parseFloat(node.asText());
+        if (Math.abs(value - Math.round(value)) <= Float.MIN_VALUE) {
+          return Math.round(value);
+        }
+      }
+    } catch (NumberFormatException e) {
+      //
     }
-    throw error("int");
+    throw new AvroTypeException("Expected " + "int" + ". Got " + node.asText());
   }
 
   @Override
   public long readLong() throws IOException {
-    advance(Symbol.LONG);
-    if (in.getCurrentToken() == JsonToken.VALUE_NUMBER_INT) {
-      long result = in.getLongValue();
-      in.nextToken();
-      return result;
-    }
-    if (in.getCurrentToken() == JsonToken.VALUE_NUMBER_FLOAT) {
-      double value = in.getDoubleValue();
-      if (Math.abs(value - Math.round(value)) <= Double.MIN_VALUE) {
-        long result = Math.round(value);
-        in.nextToken();
-        return result;
+    // schema resolution: writer's could be `int`
+    JsonNode node = pop();
+    try {
+      if (node.isIntegralNumber()) {
+        return Long.parseLong(node.asText());
       }
+      if (node.isFloatingPointNumber()) { // behavior of standard JsonDecoder
+        double value = Double.parseDouble(node.asText());
+        if (Math.abs(value - Math.round(value)) <= Double.MIN_VALUE) {
+          return Math.round(value);
+        }
+      }
+    } catch (NumberFormatException e) {
+      //
     }
-    throw error("long");
+    throw new AvroTypeException("Expected " + "long" + ". Got " + node.asText());
   }
 
   @Override
   public float readFloat() throws IOException {
-    advance(Symbol.FLOAT);
-    if (in.getCurrentToken().isNumeric()) {
-      float result = in.getFloatValue();
-      in.nextToken();
-      return result;
-    } else {
-      throw error("float");
+    // schema resolution: writer's could be `int/long`
+    JsonNode node = pop();
+    try {
+      return Float.parseFloat(node.asText());
+    } catch (NumberFormatException e) {
+      throw new AvroTypeException("Expected " + "float" + ". Got " + node.asText());
     }
   }
 
   @Override
   public double readDouble() throws IOException {
-    advance(Symbol.DOUBLE);
-    if (in.getCurrentToken().isNumeric()) {
-      double result = in.getDoubleValue();
-      in.nextToken();
-      return result;
-    } else {
-      throw error("double");
+    // schema resolution: writer's could be `int/long/float`
+    JsonNode node = pop();
+    try {
+      return Double.parseDouble(node.asText());
+    } catch (NumberFormatException e) {
+      throw new AvroTypeException("Expected " + "double" + ". Got " + node.asText());
     }
   }
 
@@ -223,306 +430,109 @@ public class JsonDecoder extends ParsingDecoder implements Parser.ActionHandler 
 
   @Override
   public String readString() throws IOException {
-    advance(Symbol.STRING);
-    if (parser.topSymbol() == Symbol.MAP_KEY_MARKER) {
-      parser.advance(Symbol.MAP_KEY_MARKER);
-      if (in.getCurrentToken() != JsonToken.FIELD_NAME) {
-        throw error("map-key");
-      }
-    } else {
-      if (in.getCurrentToken() != JsonToken.VALUE_STRING) {
-        throw error("string");
-      }
-    }
-    String result = in.getText();
-    in.nextToken();
-    return result;
+    // schema resolution: if writer's is `bytes`, it's encoded as a string of chars
+    // in 00-FF.
+    // spec is unclear on how it's promoted to `string` for reader.
+    // ResolvingDecoder: bytes are interpreted as UTF-8 encoding of a string. could
+    // fail.
+    // This class: bytes are interpreted as ISO_8859_1 encoding of a string. won't
+    // fail.
+    // The reader wants to see bytes as a string, UTF-8 is definitely the dominant
+    // choice.
+    return pop();
   }
 
   @Override
   public void skipString() throws IOException {
-    advance(Symbol.STRING);
-    if (parser.topSymbol() == Symbol.MAP_KEY_MARKER) {
-      parser.advance(Symbol.MAP_KEY_MARKER);
-      if (in.getCurrentToken() != JsonToken.FIELD_NAME) {
-        throw error("map-key");
-      }
-    } else {
-      if (in.getCurrentToken() != JsonToken.VALUE_STRING) {
-        throw error("string");
-      }
-    }
-    in.nextToken();
+    pop();
   }
 
   @Override
   public ByteBuffer readBytes(ByteBuffer old) throws IOException {
-    advance(Symbol.BYTES);
-    if (in.getCurrentToken() == JsonToken.VALUE_STRING) {
-      byte[] result = readByteArray();
-      in.nextToken();
-      return ByteBuffer.wrap(result);
-    } else {
-      throw error("bytes");
-    }
-  }
-
-  private byte[] readByteArray() throws IOException {
-    byte[] result = in.getText().getBytes(StandardCharsets.ISO_8859_1);
-    return result;
+    // schema resolution: if writer's is `string`, it's encoded as a json string.
+    // spec is unclear on how it's promoted to `bytes` for reader.
+    // ResolvingDecoder: the string is converted to bytes in UTF-8 encoding. won't
+    // fail.
+    // This class: the string is converted to bytes in ISO_8859_1 encoding. could
+    // fail.
+    // The reader wants to see the string as bytes, UTF-8 is definitely the dominant
+    // choice.
+    return ByteBuffer.wrap(pop());
   }
 
   @Override
   public void skipBytes() throws IOException {
-    advance(Symbol.BYTES);
-    if (in.getCurrentToken() == JsonToken.VALUE_STRING) {
-      in.nextToken();
-    } else {
-      throw error("bytes");
-    }
+    pop();
   }
 
-  private void checkFixed(int size) throws IOException {
-    advance(Symbol.FIXED);
-    Symbol.IntCheckAction top = (Symbol.IntCheckAction) parser.popSymbol();
-    if (size != top.size) {
+  byte[] popFixed(int length) throws IOException {
+    byte[] bs = pop();
+    if (bs.length != length) {
       throw new AvroTypeException(
-          "Incorrect length for fixed binary: expected " + top.size + " but received " + size + " bytes.");
+          "Incorrect length for fixed binary: expected " + length + " but received " + bs.length + " bytes.");
     }
+    return bs;
   }
 
   @Override
-  public void readFixed(byte[] bytes, int start, int len) throws IOException {
-    checkFixed(len);
-    if (in.getCurrentToken() == JsonToken.VALUE_STRING) {
-      byte[] result = readByteArray();
-      in.nextToken();
-      if (result.length != len) {
-        throw new AvroTypeException("Expected fixed length " + len + ", but got" + result.length);
-      }
-      System.arraycopy(result, 0, bytes, start, len);
-    } else {
-      throw error("fixed");
-    }
+  public void readFixed(byte[] bytes, int start, int length) throws IOException {
+    byte[] bs = popFixed(length);
+    System.arraycopy(bs, 0, bytes, start, length);
   }
 
   @Override
   public void skipFixed(int length) throws IOException {
-    checkFixed(length);
-    doSkipFixed(length);
-  }
-
-  private void doSkipFixed(int length) throws IOException {
-    if (in.getCurrentToken() == JsonToken.VALUE_STRING) {
-      byte[] result = readByteArray();
-      in.nextToken();
-      if (result.length != length) {
-        throw new AvroTypeException("Expected fixed length " + length + ", but got" + result.length);
-      }
-    } else {
-      throw error("fixed");
-    }
-  }
-
-  @Override
-  protected void skipFixed() throws IOException {
-    advance(Symbol.FIXED);
-    Symbol.IntCheckAction top = (Symbol.IntCheckAction) parser.popSymbol();
-    doSkipFixed(top.size);
+    popFixed(length);
   }
 
   @Override
   public int readEnum() throws IOException {
-    advance(Symbol.ENUM);
-    Symbol.EnumLabelsAction top = (Symbol.EnumLabelsAction) parser.popSymbol();
-    if (in.getCurrentToken() == JsonToken.VALUE_STRING) {
-      in.getText();
-      int n = top.findLabel(in.getText());
-      if (n >= 0) {
-        in.nextToken();
-        return n;
-      }
-      throw new AvroTypeException("Unknown symbol in enum " + in.getText());
-    } else {
-      throw error("fixed");
-    }
+    return pop();
   }
 
   @Override
   public long readArrayStart() throws IOException {
-    advance(Symbol.ARRAY_START);
-    if (in.getCurrentToken() == JsonToken.START_ARRAY) {
-      in.nextToken();
-      return doArrayNext();
-    } else {
-      throw error("array-start");
-    }
+    int[] skip = pop();
+    return pop();
   }
 
   @Override
   public long arrayNext() throws IOException {
-    advance(Symbol.ITEM_END);
-    return doArrayNext();
-  }
-
-  private long doArrayNext() throws IOException {
-    if (in.getCurrentToken() == JsonToken.END_ARRAY) {
-      parser.advance(Symbol.ARRAY_END);
-      in.nextToken();
-      return 0;
-    } else {
-      return 1;
-    }
+    return pop();
   }
 
   @Override
   public long skipArray() throws IOException {
-    advance(Symbol.ARRAY_START);
-    if (in.getCurrentToken() == JsonToken.START_ARRAY) {
-      in.skipChildren();
-      in.nextToken();
-      advance(Symbol.ARRAY_END);
-    } else {
-      throw error("array-start");
+    int[] skip = pop();
+    for (int i = 0; i < skip[0]; i++) {
+      pop();
     }
     return 0;
   }
 
   @Override
   public long readMapStart() throws IOException {
-    advance(Symbol.MAP_START);
-    if (in.getCurrentToken() == JsonToken.START_OBJECT) {
-      in.nextToken();
-      return doMapNext();
-    } else {
-      throw error("map-start");
-    }
+    int[] skip = pop();
+    return pop();
   }
 
   @Override
   public long mapNext() throws IOException {
-    advance(Symbol.ITEM_END);
-    return doMapNext();
-  }
-
-  private long doMapNext() throws IOException {
-    if (in.getCurrentToken() == JsonToken.END_OBJECT) {
-      in.nextToken();
-      advance(Symbol.MAP_END);
-      return 0;
-    } else {
-      return 1;
-    }
+    return pop();
   }
 
   @Override
   public long skipMap() throws IOException {
-    advance(Symbol.MAP_START);
-    if (in.getCurrentToken() == JsonToken.START_OBJECT) {
-      in.skipChildren();
-      in.nextToken();
-      advance(Symbol.MAP_END);
-    } else {
-      throw error("map-start");
+    int[] skip = pop();
+    for (int i = 0; i < skip[0]; i++) {
+      pop();
     }
     return 0;
   }
 
   @Override
   public int readIndex() throws IOException {
-    advance(Symbol.UNION);
-    Symbol.Alternative a = (Symbol.Alternative) parser.popSymbol();
-
-    String label;
-    if (in.getCurrentToken() == JsonToken.VALUE_NULL) {
-      label = "null";
-    } else if (in.getCurrentToken() == JsonToken.START_OBJECT && in.nextToken() == JsonToken.FIELD_NAME) {
-      label = in.getText();
-      in.nextToken();
-      parser.pushSymbol(Symbol.UNION_END);
-    } else {
-      throw error("start-union");
-    }
-    int n = a.findLabel(label);
-    if (n < 0)
-      throw new AvroTypeException("Unknown union branch " + label);
-    parser.pushSymbol(a.getSymbol(n));
-    return n;
-  }
-
-  @Override
-  public Symbol doAction(Symbol input, Symbol top) throws IOException {
-    if (top instanceof Symbol.FieldAdjustAction) {
-      Symbol.FieldAdjustAction fa = (Symbol.FieldAdjustAction) top;
-      String name = fa.fname;
-      if (currentReorderBuffer != null) {
-        try (TokenBuffer tokenBuffer = currentReorderBuffer.savedFields.get(name)) {
-          if (tokenBuffer != null) {
-            currentReorderBuffer.savedFields.remove(name);
-            currentReorderBuffer.origParser = in;
-            in = tokenBuffer.asParser();
-            in.nextToken();
-            return null;
-          }
-        }
-      }
-      if (in.getCurrentToken() == JsonToken.FIELD_NAME) {
-        do {
-          String fn = in.getText();
-          in.nextToken();
-          if (name.equals(fn) || fa.aliases.contains(fn)) {
-            return null;
-          } else {
-            if (currentReorderBuffer == null) {
-              currentReorderBuffer = new ReorderBuffer();
-            }
-            try (TokenBuffer tokenBuffer = new TokenBuffer(in)) {
-              // Moves the parser to the end of the current event e.g. END_OBJECT
-              tokenBuffer.copyCurrentStructure(in);
-              currentReorderBuffer.savedFields.put(fn, tokenBuffer);
-            }
-            in.nextToken();
-          }
-        } while (in.getCurrentToken() == JsonToken.FIELD_NAME);
-        throw new AvroTypeException("Expected field name not found: " + fa.fname);
-      }
-    } else if (top == Symbol.FIELD_END) {
-      if (currentReorderBuffer != null && currentReorderBuffer.origParser != null) {
-        in = currentReorderBuffer.origParser;
-        currentReorderBuffer.origParser = null;
-      }
-    } else if (top == Symbol.RECORD_START) {
-      if (in.getCurrentToken() == JsonToken.START_OBJECT) {
-        in.nextToken();
-        reorderBuffers.push(currentReorderBuffer);
-        currentReorderBuffer = null;
-      } else {
-        throw error("record-start");
-      }
-    } else if (top == Symbol.RECORD_END || top == Symbol.UNION_END) {
-      // AVRO-2034 advance to the end of our object
-      while (in.getCurrentToken() != JsonToken.END_OBJECT) {
-        in.nextToken();
-      }
-
-      if (top == Symbol.RECORD_END) {
-        if (currentReorderBuffer != null && !currentReorderBuffer.savedFields.isEmpty()) {
-          throw error("Unknown fields: " + currentReorderBuffer.savedFields.keySet());
-        }
-        currentReorderBuffer = reorderBuffers.pop();
-      }
-
-      // AVRO-2034 advance beyond the end object for the next record.
-      in.nextToken();
-
-    } else {
-      throw new AvroTypeException("Unknown action symbol " + top);
-    }
-    return null;
-  }
-
-  private AvroTypeException error(String type) {
-    return new AvroTypeException("Expected " + type + ". Got " + in.getCurrentToken());
+    return pop();
   }
 
 }

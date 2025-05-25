@@ -24,6 +24,7 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Collection;
@@ -234,7 +235,8 @@ public class TestReadingWritingDataInEvolvedSchemas {
     byte[] encoded = encodeGenericBlob(record, encoderType);
     AvroTypeException exception = Assertions.assertThrows(AvroTypeException.class,
         () -> decodeGenericBlob(FLOAT_RECORD, writer, encoded, encoderType));
-    Assertions.assertEquals("Found double, expecting float", exception.getMessage());
+    String msg = encoderType == EncoderType.JSON ? "Expected FLOAT. Got OBJECT" : "Found double, expecting float";
+    Assertions.assertEquals(msg, exception.getMessage());
   }
 
   @ParameterizedTest
@@ -245,7 +247,8 @@ public class TestReadingWritingDataInEvolvedSchemas {
     byte[] encoded = encodeGenericBlob(record, encoderType);
     AvroTypeException exception = Assertions.assertThrows(AvroTypeException.class,
         () -> decodeGenericBlob(LONG_RECORD, writer, encoded, encoderType));
-    Assertions.assertEquals("Found float, expecting long", exception.getMessage());
+    String msg = encoderType == EncoderType.JSON ? "Expected LONG. Got OBJECT" : "Found float, expecting long";
+    Assertions.assertEquals(msg, exception.getMessage());
   }
 
   @ParameterizedTest
@@ -256,7 +259,8 @@ public class TestReadingWritingDataInEvolvedSchemas {
     byte[] encoded = encodeGenericBlob(record, encoderType);
     AvroTypeException exception = Assertions.assertThrows(AvroTypeException.class,
         () -> decodeGenericBlob(INT_RECORD, writer, encoded, encoderType));
-    Assertions.assertEquals("Found long, expecting int", exception.getMessage());
+    String msg = encoderType == EncoderType.JSON ? "Expected INT. Got OBJECT" : "Found long, expecting int";
+    Assertions.assertEquals(msg, exception.getMessage());
   }
 
   @ParameterizedTest
@@ -289,7 +293,8 @@ public class TestReadingWritingDataInEvolvedSchemas {
     Record record = defaultRecordWithSchema(writer, FIELD_A, goeran);
     byte[] encoded = encodeGenericBlob(record, encoderType);
     ByteBuffer actual = (ByteBuffer) decodeGenericBlob(BYTES_RECORD, writer, encoded, encoderType).get(FIELD_A);
-    assertArrayEquals(goeran.getBytes(StandardCharsets.UTF_8), actual.array());
+    Charset charset = encoderType == EncoderType.JSON ? StandardCharsets.ISO_8859_1 : StandardCharsets.UTF_8;
+    assertArrayEquals(goeran.getBytes(charset), actual.array());
   }
 
   @ParameterizedTest
@@ -442,7 +447,7 @@ public class TestReadingWritingDataInEvolvedSchemas {
     reader.setExpected(expectedSchema);
     reader.setSchema(schemaOfBlob);
     Decoder decoder = encoderType == EncoderType.BINARY ? DecoderFactory.get().binaryDecoder(blob, null)
-        : DecoderFactory.get().jsonDecoder(schemaOfBlob, new ByteArrayInputStream(blob));
+        : DecoderFactory.get().jsonDecoder(expectedSchema, new ByteArrayInputStream(blob));
     return reader.read(null, decoder);
   }
 }

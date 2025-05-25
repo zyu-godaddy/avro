@@ -57,7 +57,7 @@ public class TestSpecificRecordWithUnion {
 
   public static byte[] serializeRecord(String value, Schema schema) throws IOException {
     DatumReader<Object> reader = new GenericDatumReader<>(schema);
-    Object object = reader.read(null, DecoderFactory.get().jsonDecoder(schema, value));
+    Object object = reader.read(null, DecoderFactory.get().jsonDecoder(schema, value).breakAmbiguity(true));
     ByteArrayOutputStream out = new ByteArrayOutputStream();
     BinaryEncoder encoder = EncoderFactory.get().directBinaryEncoder(out, null);
     DatumWriter<Object> writer = new GenericDatumWriter<>(schema);

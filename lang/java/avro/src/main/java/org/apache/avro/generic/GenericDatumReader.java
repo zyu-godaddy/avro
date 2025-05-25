@@ -35,6 +35,7 @@ import org.apache.avro.Schema.Field;
 import org.apache.avro.io.DatumReader;
 import org.apache.avro.io.Decoder;
 import org.apache.avro.io.DecoderFactory;
+import org.apache.avro.io.JsonDecoder;
 import org.apache.avro.io.ResolvingDecoder;
 import org.apache.avro.util.Utf8;
 import org.apache.avro.util.WeakIdentityHashMap;
@@ -142,6 +143,7 @@ public class GenericDatumReader<D> implements DatumReader<D> {
   @Override
   @SuppressWarnings("unchecked")
   public D read(D reuse, Decoder in) throws IOException {
+    Schema actual = (in instanceof JsonDecoder) ? expected : this.actual;
     if (data.isFastReaderEnabled()) {
       if (this.fastDatumReader == null) {
         this.fastDatumReader = data.getFastReaderBuilder().createDatumReader(actual, expected);

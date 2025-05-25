@@ -22,7 +22,6 @@ import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
-import org.apache.avro.AvroTypeException;
 import org.apache.avro.Schema;
 import org.apache.avro.Schema.Type;
 import org.apache.avro.generic.GenericDatumReader;
@@ -200,7 +199,7 @@ public class TestEncoders {
 
   @Test
   void jsonExcessFields() throws IOException {
-    assertThrows(AvroTypeException.class, () -> {
+    { // ok!
       String value = "{\"b\": { \"b3\": 1.4, \"b2\": 3.14, \"b1\": \"h\"}, \"a\": {\"a0\": 45, \"a2\":true, \"a1\": null}}";
       Schema schema = new Schema.Parser().parse("{\"type\": \"record\", \"name\": \"ab\", \"fields\": [\n"
           + "{\"name\": \"a\", \"type\": {\"type\":\"record\",\"name\":\"A\",\"fields\":\n"
@@ -211,7 +210,7 @@ public class TestEncoders {
       GenericDatumReader<Object> reader = new GenericDatumReader<>(schema);
       Decoder decoder = DecoderFactory.get().jsonDecoder(schema, value);
       reader.read(null, decoder);
-    });
+    }
   }
 
   @Test

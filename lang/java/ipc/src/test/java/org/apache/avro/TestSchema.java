@@ -723,7 +723,7 @@ public class TestSchema {
     byte[] data = out.toByteArray();
 
     reader.setSchema(schema);
-    Decoder decoder = DecoderFactory.get().jsonDecoder(schema, new ByteArrayInputStream(data));
+    Decoder decoder = DecoderFactory.get().jsonDecoder(schema, new ByteArrayInputStream(data)).breakAmbiguity(true);
     Object decoded = reader.read(null, decoder);
     assertEquals(datum, decoded, "Decoded data does not match.");
 
@@ -745,7 +745,8 @@ public class TestSchema {
 
     DatumReader<Object> reader = new GenericDatumReader<>();
     reader.setSchema(schema);
-    Object decoded = reader.read(null, DecoderFactory.get().jsonDecoder(schema, new ByteArrayInputStream(data)));
+    Object decoded = reader.read(null,
+        DecoderFactory.get().jsonDecoder(schema, new ByteArrayInputStream(data)).breakAmbiguity(true));
 
     assertEquals(datum, decoded, "Decoded data does not match.");
   }

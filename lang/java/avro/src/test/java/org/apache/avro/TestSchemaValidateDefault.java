@@ -43,9 +43,9 @@ public class TestSchemaValidateDefault {
     ExampleRecord writtenValue = new ExampleRecord(new ComplexValue(42L), new ComplexValue(666L));
     byte[] bytes = getSerializer(ExampleRecord.SCHEMA_WITH_ONE_FIELD).apply(writtenValue);
 
-    ReflectDatumReader<ExampleRecord> reader = new ReflectDatumReader<>(ExampleRecord.SCHEMA_WITH_ONE_FIELD,
+    ReflectDatumReader<ExampleRecord> reader = new ReflectDatumReader<>(ExampleRecord.SCHEMA_WITH_TWO_FIELDS,
         ExampleRecord.SCHEMA_WITH_TWO_FIELDS, ReflectData.get());
-    Decoder decoder = DecoderFactory.get().jsonDecoder(ExampleRecord.SCHEMA_WITH_ONE_FIELD,
+    Decoder decoder = DecoderFactory.get().jsonDecoder(ExampleRecord.SCHEMA_WITH_TWO_FIELDS,
         new ByteArrayInputStream(bytes));
     ExampleRecord deserializedValue = reader.read(null, decoder);
 
